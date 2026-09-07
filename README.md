@@ -152,13 +152,24 @@ docker compose up -d        # 构建镜像 + 启动容器（首次构建约 5-10
 docker compose ps
 ```
 
-国内构建加速（二选一）：
+国内构建加速（均为 build-arg，按需组合；compose 里也有注释样例）：
 
 ```bash
-docker compose build --build-arg HF_ENDPOINT=https://hf-mirror.com
-# 或走宿主机代理（macOS Docker Desktop 访问宿主机 socks5 用 host.docker.internal）
-docker compose build --build-arg HTTPS_PROXY=socks5://host.docker.internal:1097
+# Docker Hub 不可达 → 基础镜像走加速站；PyPI 走清华源；HF 走镜像站
+docker compose build \
+  --build-arg BASE_IMAGE=docker.1ms.run/library/python:3.11-slim \
+  --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+  --build-arg HF_ENDPOINT=https://hf-mirror.com
 ```
+
+完全离线构建：往 `wheels/` 放一个 torch linux CPU wheel
+（`pip download "torch==2.9.1+cpu" --index-url https://download.pytorch.org/whl/cpu
+--only-binary=:all: --platform manylinux_2_28_aarch64 --python-version 3.11 --no-deps`；
+注意 PyPI 上 aarch64 的 torch≥2.14 会拖 GB 级 CUDA 依赖，别直接用 PyPI 版），
+再往 `models-cache/` 放 HF 快照目录（`models--NeoQuasar--*`，从
+`~/.cache/huggingface/hub/` 拷贝即可），构建全程零下载。
+代理说明：`wheels/` 内置 PySocks/socksio 离线 wheel，Docker Desktop 注入的
+socks5 代理（~/.docker/config.json proxies）在构建期可直接用。
 
 换大模型：
 
