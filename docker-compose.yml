@@ -1,0 +1,35 @@
+services:
+  kronos-mcp:
+    build:
+      context: .
+      args:
+        # 构建期预下载的模型（默认 Kronos-small，约 100MB 权重）
+        KRONOS_MODEL: "NeoQuasar/Kronos-small"
+        # 国内构建走镜像站；或给 build 传宿主机代理：
+        #   docker compose build --build-arg HTTPS_PROXY=http://host.docker.internal:1097
+        HF_ENDPOINT: ""
+    image: kronos-mcp:latest
+    container_name: kronos-mcp
+    ports:
+      - "50059:50059"
+    environment:
+      PYTHONUNBUFFERED: "1"
+      # 模型配置（默认值即右侧注释；改 KRONOS_MODEL 换模型，首次 forecast 惰性下载）
+      # KRONOS_MODEL: NeoQuasar/Kronos-small    # 另有 Kronos-mini / Kronos-base
+      # KRONOS_DEVICE: auto                     # auto: cuda > mps > cpu
+      # HF_ENDPOINT: https://hf-mirror.com      # 运行时换模型下载走镜像站
+      # license 鉴权（可选）：设置后强制 X-License-Key
+      # MCP_LICENSE_FILE: /app/licenses/licenses.json
+      # MCP_WORKERS: "2"            # 异步任务 worker 数（默认 2）
+      # MCP_QUEUE_SIZE: "50"
+      # MCP_USAGE_DIR: /app/usage   # license 用量计数目录
+    volumes:
+      # - ./licenses.json:/app/licenses/licenses.json:ro   # license key 文件
+      # - ./usage:/app/usage                               # 用量计数持久化
+      # 模型缓存卷（可选）：换模型/下载新模型时避免容器重建后重下
+      # - kronos-models:/models
+      []
+    restart: unless-stopped
+
+# volumes:
+#   kronos-models:

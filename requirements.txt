@@ -1,0 +1,9 @@
+numpy>=1.26
+pandas>=2.0
+# torch：本地安装直接随本文件解析（macOS 自带 Metal/MPS wheel）；
+# Docker 镜像在 Dockerfile 里先用 CPU index-url 单独装一层以控制体积
+torch>=2.0
+einops>=0.8
+huggingface_hub>=0.30
+tqdm>=4.66
+safetensors>=0.4

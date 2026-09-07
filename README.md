@@ -1,0 +1,246 @@
+# Kronos MCP
+
+清华开源 K 线时序基础模型 [Kronos](https://github.com/shiyu-coder/Kronos)
+（论文 [arXiv:2508.02739](https://arxiv.org/abs/2508.02739)，AAAI 2026）的独立
+MCP（Model Context Protocol）HTTP 服务。零样本（zero-shot）输入任意 OHLCV
+K 线序列，输出未来 open/high/low/close/volume 预测路径与交易视角信号，让任何
+MCP 客户端（Claude Desktop、Kimi Code、Cursor、自研 Agent）直接调用金融市场
+时序基础模型。
+
+模型代码与权重均为 **MIT** 协议（上游 `model/` 目录原样 vendor 进本仓，
+许可证见 `LICENSE-Kronos`）。本服务代码同样 MIT。
+
+## 工具清单（4 个）
+
+| 工具 | 说明 | 负载 |
+|------|------|------|
+| `forecast_kline` | 零样本 K 线预测：OHLCV 历史序列 → pred_len 根预测 K 线（OHLCV 均值路径）+ summary（方向/预期收益/预测波动率/耗时）。预测轴时间戳支持 `future_timestamps` 显式指定，否则按输入中位间隔自动顺延（日频/分钟频自适应），解析失败退回 index 序号并标注 | 中（同步） |
+| `forecast_signal` | 交易视角信号：同一输入跑 N=min(sample_count,5) 次独立采样，统计终点收益方向一致率与离散度 → direction / expected_return_pct / confidence(0-1) / risk_note | 中（同步，比 forecast_kline 慢 N 倍） |
+| `forecast_batch` | 批量预测：series_list 每项 {id, klines}，逐项容错（单项失败带 error 不拖垮整批）。入 JobQueue 异步执行，返回 job_id 轮询 `GET /jobs/<id>` | 重（异步） |
+| `model_info` | 当前已加载模型、参数量、device、max_context、内存/显存占用、HF 可用模型清单 | 轻（同步） |
+
+约定：`lookback ≤ max_context(512)`，`pred_len ≥ 1`；`amount` 缺省时用
+`volume*close` 近似。所有输出统一带 `method: "kronos-zero-shot"`。
+
+## 快速开始
+
+```bash
+pip install -r requirements.txt
+python3 server.py --port 50059
+```
+
+首次 forecast 调用时才从 HuggingFace 下载并加载模型（惰性加载，默认
+`NeoQuasar/Kronos-small` 24.7M 参数）。国内网络可设镜像站：
+
+```bash
+export HF_ENDPOINT=https://hf-mirror.com
+```
+
+验证：
+
+```bash
+curl http://127.0.0.1:50059/health
+curl http://127.0.0.1:50059/tools   # 应返回 4 个工具
+```
+
+接入 MCP 客户端（以 Claude Desktop / Kimi Code 为例）：
+
+```yaml
+# mcp 配置
+kronos:
+  url: http://127.0.0.1:50059/mcp
+```
+
+## 调用示例
+
+### forecast_kline — K 线预测
+
+```bash
+curl -s http://127.0.0.1:50059/mcp -d '{
+  "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+  "params": {"name": "forecast_kline", "arguments": {
+    "klines": [{"timestamps": "2024-08-29 11:25:00", "open": 9.86, "high": 9.89,
+                "low": 9.86, "close": 9.86, "volume": 625.0, "amount": 617074.0}, ...],
+    "pred_len": 120, "lookback": 400, "sample_count": 5
+  }}}'
+```
+
+返回（JSON 字符串）：
+
+```json
+{"method": "kronos-zero-shot",
+ "predictions": [{"timestamps": "2024-08-29 11:30:00", "open": 9.87, "high": 9.90,
+                  "low": 9.85, "close": 9.88, "volume": 512.0}, ...],
+ "summary": {"last_close": 9.86, "pred_close_at_horizon": 9.92,
+             "expected_return_pct": 0.61, "direction": "up",
+             "pred_volatility": 0.35, "model": "NeoQuasar/Kronos-small",
+             "device": "mps", "elapsed_ms": 18230},
+ "timestamps_mode": "inferred"}
+```
+
+`timestamps_mode`：`provided`（用了 future_timestamps）/ `inferred`（按输入
+中位间隔顺延）/ `index`（时间戳解析失败，退回序号，另带 `timestamps_note`）。
+
+### forecast_signal — 交易信号
+
+```bash
+curl -s http://127.0.0.1:50059/mcp -d '{
+  "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+  "params": {"name": "forecast_signal", "arguments": {
+    "klines": [...], "pred_len": 10, "sample_count": 3
+  }}}'
+```
+
+返回：
+
+```json
+{"method": "kronos-zero-shot", "model": "NeoQuasar/Kronos-small", "device": "mps",
+ "direction": "up", "expected_return_pct": 0.42, "confidence": 0.75, "runs": 3,
+ "sample_returns_pct": [0.45, 0.38, 0.43], "sign_consistency": 1.0,
+ "return_std_pct": 0.036, "risk_note": "多次采样方向一致、离散度低，信号相对可靠（仍为统计预测，非投资建议）",
+ "summary": {...}, "timestamps_mode": "inferred"}
+```
+
+confidence = 方向一致率 × 1/(1+收益std%)：采样方向越一致、离散越小越接近 1。
+
+### forecast_batch — 批量（异步）
+
+```bash
+# 1) 提交 → 拿 job_id
+curl -s http://127.0.0.1:50059/mcp -d '{
+  "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+  "params": {"name": "forecast_batch", "arguments": {
+    "series_list": [{"id": "sh600977", "klines": [...]},
+                    {"id": "bad", "klines": [{"timestamps": "x"}]}],
+    "pred_len": 20
+  }}}'
+# → {"job_id": "ab12cd34ef56", "status": "queued", "poll": "/jobs/ab12cd34ef56", ...}
+
+# 2) 轮询取结果（单项失败不拖垮整批，带 error 字段）
+curl -s http://127.0.0.1:50059/jobs/ab12cd34ef56
+```
+
+### model_info
+
+```bash
+curl -s http://127.0.0.1:50059/mcp -d '{
+  "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+  "params": {"name": "model_info", "arguments": {}}}'
+# → {"loaded": true, "model": "NeoQuasar/Kronos-small", "param_count": 24691208,
+#    "device": "mps", "max_context": 512, "available_models": [...], ...}
+```
+
+## 模型配置
+
+| 环境变量 | 默认 | 说明 |
+|----------|------|------|
+| `KRONOS_MODEL` | `NeoQuasar/Kronos-small` | 预测模型（另有 `Kronos-mini` 4.1M / `Kronos-base` 102.3M，均 MIT） |
+| `KRONOS_TOKENIZER` | `NeoQuasar/Kronos-Tokenizer-base` | K 线分词器 |
+| `KRONOS_DEVICE` | `auto` | `auto` = cuda > mps > cpu；也可显式 `cpu`/`cuda`/`mps` |
+| `MODEL_CACHE` | 空 | 模型快照本地目录（Docker 镜像内置 `/models` 预下载）；设置后优先读本地，配 `HF_HUB_OFFLINE=1` 可纯离线 |
+| `HF_ENDPOINT` | 空 | 透传 huggingface_hub，国内设 `https://hf-mirror.com` |
+
+也可在单次调用里传 `model` 参数热切换模型（与当前不一致时自动重载）。
+
+## Docker 部署
+
+镜像构建期**预下载模型**到 `/models`（torch 装 CPU 版控制体积），容器首次
+forecast 离线命中本地缓存、秒级响应：
+
+```bash
+docker compose up -d        # 构建镜像 + 启动容器（首次构建约 5-10 分钟）
+docker compose ps
+```
+
+国内构建加速（二选一）：
+
+```bash
+docker compose build --build-arg HF_ENDPOINT=https://hf-mirror.com
+# 或走宿主机代理（macOS Docker Desktop 访问宿主机 socks5 用 host.docker.internal）
+docker compose build --build-arg HTTPS_PROXY=socks5://host.docker.internal:1097
+```
+
+换大模型：
+
+```bash
+docker compose build --build-arg KRONOS_MODEL=NeoQuasar/Kronos-base
+# 或不重建镜像：docker compose run -e KRONOS_MODEL=NeoQuasar/Kronos-base ...
+# （首次 forecast 时惰性下载；compose 里取消注释 kronos-models 卷可避免重下）
+```
+
+验证：
+
+```bash
+curl http://127.0.0.1:50059/health
+curl http://127.0.0.1:50059/tools   # 应返回 4 个工具
+```
+
+license 鉴权（可选）：在 `docker-compose.yml` 中取消注释，把宿主机
+`licenses.json` 挂进容器并设置 `MCP_LICENSE_FILE`。
+
+## 与 Athena / 系列仓组合
+
+```
+astock-data-mcp / global-data-mcp   取 K 线（A股/全球行情）
+        ↓ klines JSON
+kronos-mcp (本仓 :50059)            Kronos 零样本预测 → 方向/预期收益/置信度
+        ↓ 预测路径作为候选因子或信号
+factor-miner-mcp (:50053)           因子回测/OOS 验证信号有效性
+causal-mcp (:50057)                 事件研究/反事实验证信号因果性
+```
+
+示例：用 astock-data-mcp 拉 sh600977 的 5 分钟线 → 本仓 `forecast_signal`
+得 direction/confidence → factor-miner-mcp `factor_backtest` 验证该信号在
+历史上的 IC/收益表现。
+
+## 端点一览
+
+```
+GET  /health        健康检查
+GET  /tools         工具 JSON schema 列表
+POST /mcp           MCP JSON-RPC（initialize / tools/list / tools/call）
+GET  /jobs/<id>     异步任务状态/结果（forecast_batch）
+GET  /quota         license 额度余量（鉴权模式）
+GET  /queue-stats   队列概况
+```
+
+## 鉴权与额度（可选）
+
+默认开放模式（本地/内网）。设置环境变量后强制 license key 鉴权：
+
+```bash
+export MCP_LICENSE_FILE=/path/to/licenses.json
+python3 server.py --port 50059
+# 客户端请求头：X-License-Key: <key>
+```
+
+license JSON 格式与额度语义见 `mcp_gateway.py` docstring（与
+[factor-miner-mcp](https://github.com/JingxuanC/factor-miner-mcp) /
+[causal-mcp](https://github.com/JingxuanC/causal-mcp) 相同）。
+`GET /quota` 查余量，`GET /queue-stats` 看队列。重负载工具
+（forecast_batch）计入 heavy_quota。
+
+## Roadmap
+
+- **Finetune 工具**：上游 [`finetune/`](https://github.com/shiyu-coder/Kronos/tree/master/finetune)
+  目录支持基于 qlib 数据的微调（含 `finetune_csv` 自定义 CSV 管线），
+  后续可封装为 `forecast_finetune` 异步工具（训练重负载，走 JobQueue）
+- **Kronos-large**：上游预告 2026 Q1 发布更大模型，发布后 `KRONOS_MODEL`
+  直接切换即可
+- 更多市场适配：加密/期货高频线验证
+
+## 致谢
+
+- 模型与 `model/` 代码来自 [Kronos](https://github.com/shiyu-coder/Kronos)
+  （MIT，vendor 自上游 commit `67b630e`，LICENSE 见 `LICENSE-Kronos`）
+- 论文：Shi et al., "Kronos: A Foundation Model for the Language of
+  Financial Markets", [arXiv:2508.02739](https://arxiv.org/abs/2508.02739),
+  AAAI 2026；模型权重 [HuggingFace NeoQuasar](https://huggingface.co/NeoQuasar)（MIT）
+- `mcp_gateway.py` 与 [factor-miner-mcp](https://github.com/JingxuanC/factor-miner-mcp) /
+  [causal-mcp](https://github.com/JingxuanC/causal-mcp) 共用同一套鉴权/队列模块
+- 测试数据 `examples/data/XSHG_5min_600977.csv` 来自上游 examples（600977
+  上交所 5 分钟线，历史版本恢复，当前上游 master 已移除）
+
+## License
+
+MIT（本服务代码）；上游模型代码与权重同为 MIT（`LICENSE-Kronos`）。
