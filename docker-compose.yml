@@ -5,9 +5,12 @@ services:
       args:
         # 构建期预下载的模型（默认 Kronos-small，约 100MB 权重）
         KRONOS_MODEL: "NeoQuasar/Kronos-small"
-        # 国内构建走镜像站；或给 build 传宿主机代理：
-        #   docker compose build --build-arg HTTPS_PROXY=http://host.docker.internal:1097
-        HF_ENDPOINT: ""
+        # 国内构建加速（按需取消注释）：
+        # BASE_IMAGE: "docker.1ms.run/library/python:3.11-slim"   # Docker Hub 镜像加速站
+        # PIP_INDEX_URL: "https://pypi.tuna.tsinghua.edu.cn/simple"  # PyPI 镜像
+        # HF_ENDPOINT: "https://hf-mirror.com"                    # HF 镜像站
+        # wheels/ 放入 torch linux CPU wheel + models-cache/ 放入 HF 快照
+        # （models--NeoQuasar--* 目录）后，构建可完全离线
     image: kronos-mcp:latest
     container_name: kronos-mcp
     ports:

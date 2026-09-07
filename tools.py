@@ -100,13 +100,16 @@ class _ModelHolder:
 
     @staticmethod
     def _resolve_repo_path(repo_id: str) -> str:
-        """MODEL_CACHE 设置时走本地快照目录（构建期预下载），否则用 HF 默认缓存。"""
+        """MODEL_CACHE 设置时走本地快照目录（构建期预下载）；快照已在本地则
+        local_files_only 离线命中，不在才在线下载（不影响挂卷换模型）。
+        未设置 MODEL_CACHE 则走 HF 默认缓存。"""
         cache = os.environ.get("MODEL_CACHE", "")
         if not cache:
             return repo_id
         from huggingface_hub import snapshot_download
-        path = snapshot_download(repo_id, cache_dir=cache)
-        logger.info("resolved %s from MODEL_CACHE: %s", repo_id, path)
+        local_hit = os.path.isdir(os.path.join(cache, "models--" + repo_id.replace("/", "--")))
+        path = snapshot_download(repo_id, cache_dir=cache, local_files_only=local_hit)
+        logger.info("resolved %s (local_hit=%s): %s", repo_id, local_hit, path)
         return path
 
     def get(self, model_name: Optional[str] = None):

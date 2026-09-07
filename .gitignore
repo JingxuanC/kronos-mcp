@@ -19,3 +19,6 @@ licenses.json
 .env
 .venv/
 venv/
+models-cache/
+wheels/torch-*.whl
+.DS_Store
