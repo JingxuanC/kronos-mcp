@@ -19,7 +19,10 @@ ARG HTTP_PROXY
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
-    MODEL_CACHE=/models
+    MODEL_CACHE=/models \
+    KRONOS_MODEL=${KRONOS_MODEL} \
+    KRONOS_TOKENIZER=${KRONOS_TOKENIZER} \
+    HF_ENDPOINT=${HF_ENDPOINT}
 
 WORKDIR /app
 
@@ -41,8 +44,7 @@ COPY . .
 RUN python3 -c "\
 import os; \
 from huggingface_hub import snapshot_download; \
-for r in (os.environ['KRONOS_TOKENIZER'], os.environ['KRONOS_MODEL']): \
-    print('prefetch', r, '->', snapshot_download(r, cache_dir='/models'))"
+[print('prefetch', r, '->', snapshot_download(r, cache_dir='/models')) for r in (os.environ['KRONOS_TOKENIZER'], os.environ['KRONOS_MODEL'])]"
 
 RUN useradd --uid 10001 --no-create-home --home-dir /app appuser \
     && chown -R appuser:appuser /app /models
