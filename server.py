@@ -26,11 +26,12 @@ import argparse
 import json
 import logging
 import os
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from tools import EXTRA_SCHEMAS, HANDLERS, TOOLS  # noqa: F401 — 副作用：注册全部工具
 
-from mcp_gateway import JobQueue, LicenseStore, QueueFull, QuotaExceeded
+from mcp_gateway import METRICS, JobQueue, LicenseStore, QueueFull, QuotaExceeded
 
 logger = logging.getLogger("kronos-mcp")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -40,6 +41,19 @@ VERSION = "1.0.0"
 
 # 重负载工具：提交后入异步队列执行（返回 job_id 轮询），不占 HTTP 连接。
 ASYNC_TOOLS: set[str] = {"forecast_batch"}
+
+# 异步任务查询工具（不走 HANDLERS，在 _handle_mcp 里特殊处理；查状态不扣额度）
+JOB_STATUS_SCHEMA = {
+    "name": "job_status",
+    "description": "查询异步任务状态/结果。传入提交重任务时返回的 job_id，"
+                   "返回 status（queued/running/done/error）、result 或 error、elapsed_sec。"
+                   "重任务提交后用它轮询，无需直接 HTTP 访问 GET /jobs/<id>。",
+    "inputSchema": {
+        "type": "object",
+        "properties": {"job_id": {"type": "string", "description": "异步任务 ID"}},
+        "required": ["job_id"],
+    },
+}
 
 
 class KronosHandler(BaseHTTPRequestHandler):
@@ -60,7 +74,23 @@ class KronosHandler(BaseHTTPRequestHandler):
     def _tool_schemas(self):
         schemas = [t.to_dict() for t in TOOLS.values()]
         schemas.extend(EXTRA_SCHEMAS.values())
+        if self.job_queue:
+            schemas.append(JOB_STATUS_SCHEMA)
         return schemas
+
+    def _job_status(self, mid, tool_args):
+        job_id = str(tool_args.get("job_id", "")).strip()
+        job = (self.job_queue.get(job_id, key=self._license_key())
+               if job_id and self.job_queue else None)
+        if job is None:
+            payload = {"job_id": job_id, "status": "not_found",
+                       "note": "任务不存在/结果已过期（默认保留 1h），或不属于当前 license key"}
+        else:
+            payload = job
+        METRICS.inc_call("job_status", "ok")
+        self._send(200, {"jsonrpc": "2.0", "id": mid, "result": {
+            "content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}],
+            "isError": False}})
 
     def _license_key(self) -> str:
         return self.headers.get("X-License-Key", "")
@@ -80,6 +110,14 @@ class KronosHandler(BaseHTTPRequestHandler):
                 self._send(401, {"error": info})
                 return
             self._send(200, self.license_store.quota_of(self._license_key()))
+        elif self.path == "/metrics":
+            # Prometheus 抓取端点，不要求鉴权（只含工具名级聚合，不泄露 key）
+            body = METRICS.render(self.job_queue).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
         elif self.path == "/queue-stats":
             self._send(200, self.job_queue.stats() if self.job_queue else {})
         elif self.path.startswith("/jobs/"):
@@ -144,10 +182,15 @@ class KronosHandler(BaseHTTPRequestHandler):
             key = self._license_key()
             if store and store.enabled:
                 ok, info = store.check(key)
+                METRICS.inc_license_check("ok" if ok else "invalid")
                 if not ok:
+                    METRICS.inc_call(tool_name, "rejected_license")
                     self._send(200, {"jsonrpc": "2.0", "id": mid,
                                      "error": {"code": -32001, "message": info}})
                     return
+            if tool_name == "job_status":
+                self._job_status(mid, tool_args)
+                return
             if tool_name not in HANDLERS:
                 self._send(200, {"jsonrpc": "2.0", "id": mid,
                                  "error": {"code": -32601, "message": f"Unknown tool: {tool_name}"}})
@@ -158,6 +201,7 @@ class KronosHandler(BaseHTTPRequestHandler):
                 try:
                     store.consume(key, heavy=bool(is_async))
                 except QuotaExceeded as e:
+                    METRICS.inc_call(tool_name, "rejected_quota")
                     self._send(200, {"jsonrpc": "2.0", "id": mid,
                                      "error": {"code": -32029, "message": str(e)}})
                     return
@@ -169,21 +213,28 @@ class KronosHandler(BaseHTTPRequestHandler):
                     self._send(200, {"jsonrpc": "2.0", "id": mid,
                                      "error": {"code": -32029, "message": str(e)}})
                     return
+                METRICS.inc_call(tool_name, "queued")
                 self._send(200, {"jsonrpc": "2.0", "id": mid, "result": {
                     "content": [{"type": "text", "text": json.dumps({
                         "job_id": job_id, "status": "queued",
                         "poll": f"/jobs/{job_id}",
-                        "note": "重任务已入队，轮询 GET /jobs/<id> 拿结果",
+                        "note": "重任务已入队，调用 job_status 工具传入 job_id 轮询拿结果",
                     }, ensure_ascii=False)}], "isError": False}})
                 return
+            # 同步执行：记 ok/error + 延迟（异步任务在 JobQueue._worker 完成时记）
+            started = time.time()
             try:
                 result = HANDLERS[tool_name](**tool_args)
+                METRICS.inc_call(tool_name, "ok")
                 self._send(200, {"jsonrpc": "2.0", "id": mid, "result": {
                     "content": [{"type": "text", "text": str(result)}], "isError": False}})
             except Exception as e:  # noqa: BLE001
                 logger.error("tool call error %s: %s", tool_name, e)
+                METRICS.inc_call(tool_name, "error")
                 self._send(200, {"jsonrpc": "2.0", "id": mid, "result": {
                     "content": [{"type": "text", "text": f"Error: {e}"}], "isError": True}})
+            finally:
+                METRICS.observe_latency(tool_name, time.time() - started)
             return
 
         self._send(200, {"jsonrpc": "2.0", "id": mid,

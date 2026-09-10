@@ -386,7 +386,7 @@ def forecast_signal(klines: list, pred_len: int = 10, lookback: Optional[int] = 
 
 @tool("forecast_batch", "批量 K 线预测（异步）：series_list 每项 {id, klines}，逐项容错"
       "（单项失败不拖垮整批，结果带 error 字段）。提交后返回 job_id，"
-      "轮询 GET /jobs/<id> 取结果。每项输出同 forecast_kline 的 summary + predictions。",
+      "调用 job_status 工具轮询取结果。每项输出同 forecast_kline 的 summary + predictions。",
       {"series_list": {"type": "array",
                        "description": "[{id: string, klines: [...]}, ...]，klines 格式同 forecast_kline",
                        "items": {"type": "object"}},
