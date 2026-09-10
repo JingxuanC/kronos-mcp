@@ -7,20 +7,40 @@ K 线序列，输出未来 open/high/low/close/volume 预测路径与交易视�
 MCP 客户端（Claude Desktop、Kimi Code、Cursor、自研 Agent）直接调用金融市场
 时序基础模型。
 
-模型代码与权重均为 **MIT** 协议（上游 `model/` 目录原样 vendor 进本仓，
-许可证见 `LICENSE-Kronos`）。本服务代码同样 MIT。
+另接入亚马逊时序基础模型 **Chronos-2**（[amazon/chronos-2](https://huggingface.co/amazon/chronos-2)，
+Apache-2.0，[`chronos-forecasting`](https://github.com/amazon-science/chronos-forecasting)
+v2.x `Chronos2Pipeline`）作为可选后端：各预测工具传 `model="chronos2"` 即切换
+（只预测收盘价 close 序列，volume 作为 past covariate；输出中位数路径 +
+10%/90% 分位区间，不含 OHLC）。默认后端仍是 Kronos，行为完全不变。
 
-## 工具清单（4 个）
+模型代码与权重均为 **MIT** 协议（上游 `model/` 目录原样 vendor 进本仓，
+许可证见 `LICENSE-Kronos`）；Chronos-2 为 **Apache-2.0**。本服务代码同样 MIT。
+
+## 工具清单（5 个）
 
 | 工具 | 说明 | 负载 |
 |------|------|------|
 | `forecast_kline` | 零样本 K 线预测：OHLCV 历史序列 → pred_len 根预测 K 线（OHLCV 均值路径）+ summary（方向/预期收益/预测波动率/耗时）。预测轴时间戳支持 `future_timestamps` 显式指定，否则按输入中位间隔自动顺延（日频/分钟频自适应），解析失败退回 index 序号并标注 | 中（同步） |
 | `forecast_signal` | 交易视角信号：同一输入跑 N=min(sample_count,5) 次独立采样，统计终点收益方向一致率与离散度 → direction / expected_return_pct / confidence(0-1) / risk_note | 中（同步，比 forecast_kline 慢 N 倍） |
 | `forecast_batch` | 批量预测：series_list 每项 {id, klines}，逐项容错（单项失败带 error 不拖垮整批）。入 JobQueue 异步执行，返回 job_id 轮询 `GET /jobs/<id>` | 重（异步） |
-| `model_info` | 当前已加载模型、参数量、device、max_context、内存/显存占用、HF 可用模型清单 | 轻（同步） |
+| `forecast_compare` | 双模型对比：同一输入依次跑 kronos + chronos2，返回两边预测路径、方向是否一致（`compare.directions_agree`）、各自预期收益。单边失败不拖垮另一边（该侧带 error） | 中偏重（同步，≈两模型耗时之和） |
+| `model_info` | 当前已加载模型、参数量、device、max_context、内存/显存占用、HF 可用模型清单、chronos2 后端状态 | 轻（同步） |
 
 约定：`lookback ≤ max_context(512)`，`pred_len ≥ 1`；`amount` 缺省时用
-`volume*close` 近似。所有输出统一带 `method: "kronos-zero-shot"`。
+`volume*close` 近似。所有输出统一带 `method: "kronos-zero-shot"`
+（forecast_compare 为 `"model-compare"`）。
+
+**`model` 参数**（forecast_kline / forecast_signal / forecast_batch 通用，默认 `"kronos"`）：
+
+- `"kronos"` 或缺省：Kronos 后端，预测完整 OHLCV；
+- `"chronos2"`：Chronos-2 后端，只预测收盘价序列——预测条目中
+  `close`=中位数路径、`open`=`close`、`high`/`low`=0.9/0.1 分位、`volume`=0，
+  并加法式附加 `close_p10`/`close_p90` 字段；`summary.note` 有说明，
+  `summary.pred_volatility` 为 10%-90% 区间宽度。chronos2 是确定性分位数
+  预测（无采样随机性），`T`/`top_p`/`sample_count` 对其不生效；
+  forecast_signal 下只跑 1 次，confidence 恒为 1、不代表不确定性；
+- 向后兼容：传 Kronos 的 HF repo id（如 `NeoQuasar/Kronos-mini`）仍走
+  kronos 并热切换模型。
 
 ## 快速开始
 
@@ -40,7 +60,7 @@ export HF_ENDPOINT=https://hf-mirror.com
 
 ```bash
 curl http://127.0.0.1:50059/health
-curl http://127.0.0.1:50059/tools   # 应返回 4 个工具
+curl http://127.0.0.1:50059/tools   # 应返回 5 个工具
 ```
 
 接入 MCP 客户端（以 Claude Desktop / Kimi Code 为例）：
@@ -120,6 +140,33 @@ curl -s http://127.0.0.1:50059/mcp -d '{
 curl -s http://127.0.0.1:50059/jobs/ab12cd34ef56
 ```
 
+### forecast_compare — 双模型对比
+
+```bash
+curl -s http://127.0.0.1:50059/mcp -d '{
+  "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+  "params": {"name": "forecast_compare", "arguments": {
+    "klines": [...], "pred_len": 20
+  }}}'
+```
+
+返回：
+
+```json
+{"method": "model-compare",
+ "kronos":   {"predictions": [...], "summary": {...}, "timestamps_mode": "inferred"},
+ "chronos2": {"predictions": [{"timestamps": "...", "open": 9.87, "high": 9.95,
+                "low": 9.80, "close": 9.88, "volume": 0.0,
+                "close_p10": 9.80, "close_p90": 9.95}, ...],
+              "summary": {..., "note": "chronos2 只预测收盘价：..."}},
+ "compare": {"directions_agree": true, "kronos_direction": "up",
+             "chronos2_direction": "up", "kronos_expected_return_pct": 0.61,
+             "chronos2_expected_return_pct": 0.44, "return_diff_pct": 0.17},
+ "elapsed_ms": 41000}
+```
+
+某侧失败（如 chronos2 权重未放置）时该侧为 `{"error": "..."}`，`compare` 为 null。
+
 ### model_info
 
 ```bash
@@ -139,6 +186,7 @@ curl -s http://127.0.0.1:50059/mcp -d '{
 | `KRONOS_DEVICE` | `auto` | `auto` = cuda > mps > cpu；也可显式 `cpu`/`cuda`/`mps` |
 | `MODEL_CACHE` | 空 | 模型快照本地目录（Docker 镜像内置 `/models` 预下载）；设置后优先读本地，配 `HF_HUB_OFFLINE=1` 可纯离线 |
 | `HF_ENDPOINT` | 空 | 透传 huggingface_hub，国内设 `https://hf-mirror.com` |
+| `CHRONOS_MODEL_PATH` | `/app/models-cache/chronos-2` | Chronos-2 权重**本地目录**（`model="chronos2"` 时懒加载，`device_map="cpu"`）。GFW 环境不访问 HuggingFace，需预先把 `amazon/chronos-2` 的 HF 快照放进该目录 |
 
 也可在单次调用里传 `model` 参数热切换模型（与当前不一致时自动重载）。
 
@@ -171,6 +219,26 @@ docker compose build \
 代理说明：`wheels/` 内置 PySocks/socksio 离线 wheel，Docker Desktop 注入的
 socks5 代理（~/.docker/config.json proxies）在构建期可直接用。
 
+**Chronos-2（可选后端）离线部署**：
+
+1. 依赖：往 `wheels/` 放 `chronos_forecasting` 及其依赖闭包的 wheel
+   （`transformers`、`tokenizers`、`safetensors`、`einops` 等），Dockerfile
+   检测到 `chronos_forecasting-*.whl` 即离线安装，之后的
+   `pip install -r requirements.txt` 因依赖已满足不再联网解析它：
+   ```bash
+   pip download "chronos-forecasting>=2" -d wheels/ \
+     --only-binary=:all: --platform manylinux_2_28_aarch64 --python-version 3.11
+   # 注意剔除拖入的 torch GPU wheel（torch 由 Dockerfile 单独装 CPU 版）
+   ```
+2. 权重：把 `amazon/chronos-2` 的 HF 快照放到宿主 `models-cache/chronos-2/`
+   （bind-mount 到容器 `/app/models-cache/chronos-2`，即 `CHRONOS_MODEL_PATH`
+   默认值；可用 `huggingface-cli download amazon/chronos-2 --local-dir` 下载后拷贝）。
+   Chronos-2 懒加载，仅首次 `model="chronos2"` 请求时载入。
+3. 资源：Chronos-2 约 120M 参数（fp32 ≈ 500MB 权重），CPU 推理时 RSS 峰值约
+   1.5-2GB（与 Kronos 共存时）；3GB 内存机型可用但建议避免与 forecast_batch
+   重任务并发，首次加载约需十几秒~1 分钟（CPU 反序列化），推理时
+   `torch.set_num_threads(2)` 限线程。
+
 换大模型：
 
 ```bash
@@ -183,7 +251,7 @@ docker compose build --build-arg KRONOS_MODEL=NeoQuasar/Kronos-base
 
 ```bash
 curl http://127.0.0.1:50059/health
-curl http://127.0.0.1:50059/tools   # 应返回 4 个工具
+curl http://127.0.0.1:50059/tools   # 应返回 5 个工具
 ```
 
 license 鉴权（可选）：在 `docker-compose.yml` 中取消注释，把宿主机
@@ -247,6 +315,10 @@ license JSON 格式与额度语义见 `mcp_gateway.py` docstring（与
 - 论文：Shi et al., "Kronos: A Foundation Model for the Language of
   Financial Markets", [arXiv:2508.02739](https://arxiv.org/abs/2508.02739),
   AAAI 2026；模型权重 [HuggingFace NeoQuasar](https://huggingface.co/NeoQuasar)（MIT）
+- Chronos-2 后端：Ansari et al., "Chronos-2: From Univariate to Universal
+  Forecasting", [arXiv:2510.15821](https://arxiv.org/abs/2510.15821)；代码
+  [chronos-forecasting](https://github.com/amazon-science/chronos-forecasting)
+  与权重 [amazon/chronos-2](https://huggingface.co/amazon/chronos-2) 均为 Apache-2.0
 - `mcp_gateway.py` 与 [factor-miner-mcp](https://github.com/JingxuanC/factor-miner-mcp) /
   [causal-mcp](https://github.com/JingxuanC/causal-mcp) 共用同一套鉴权/队列模块
 - 测试数据 `examples/data/XSHG_5min_600977.csv` 来自上游 examples（600977

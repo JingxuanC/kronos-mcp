@@ -7,3 +7,7 @@ einops>=0.8
 huggingface_hub>=0.30
 tqdm>=4.66
 safetensors>=0.4
+# Chronos-2 后端（model="chronos2"）：亚马逊时序基础模型，Apache-2.0。
+# 依赖 transformers（仅推理，CPU 即可）。离线构建时由 Dockerfile 从 wheels/ 装，
+# 见 README「Docker 部署」
+chronos-forecasting>=2

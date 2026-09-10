@@ -26,7 +26,8 @@ ENV PYTHONUNBUFFERED=1 \
     MODEL_CACHE=/models \
     KRONOS_MODEL=${KRONOS_MODEL} \
     KRONOS_TOKENIZER=${KRONOS_TOKENIZER} \
-    HF_ENDPOINT=${HF_ENDPOINT}
+    HF_ENDPOINT=${HF_ENDPOINT} \
+    CHRONOS_MODEL_PATH=/app/models-cache/chronos-2
 
 WORKDIR /app
 
@@ -45,11 +46,18 @@ RUN pip install --no-index --find-links=/tmp/wheels pysocks socksio \
       pip install --index-url "$PIP_INDEX_URL" torch; \
     else \
       pip install torch --index-url https://download.pytorch.org/whl/cpu; \
-    fi \
- && rm -rf /tmp/wheels
+    fi
 
 COPY requirements.txt ./
-RUN pip install ${PIP_INDEX_URL:+--index-url "$PIP_INDEX_URL"} -r requirements.txt
+# wheels/ 内若放有 chronos_forecasting-*.whl 及其依赖闭包（transformers/tokenizers/
+# safetensors 等，部署时补充，见 README「Docker 部署」），离线安装；已满足后
+# 下一行的 -r requirements.txt 不会再联网解析 chronos-forecasting
+RUN if ls /tmp/wheels/chronos_forecasting-*.whl >/dev/null 2>&1; then \
+      echo "using vendored chronos-forecasting wheels"; \
+      pip install --no-index --find-links=/tmp/wheels chronos-forecasting; \
+    fi \
+ && pip install ${PIP_INDEX_URL:+--index-url "$PIP_INDEX_URL"} -r requirements.txt \
+ && rm -rf /tmp/wheels
 
 COPY . .
 

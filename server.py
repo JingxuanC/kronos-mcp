@@ -17,7 +17,8 @@
     （请求头 X-License-Key）；未配置 = 开放模式（本地/内网）。
 
 模型配置（见 tools.py）：KRONOS_MODEL / KRONOS_TOKENIZER / KRONOS_DEVICE /
-MODEL_CACHE / HF_ENDPOINT。模型惰性加载，首次 forecast 才下载。
+MODEL_CACHE / HF_ENDPOINT / CHRONOS_MODEL_PATH。模型惰性加载，Kronos 首次
+forecast 才下载，Chronos-2 仅 model="chronos2" 请求时从本地目录加载。
 """
 
 from __future__ import annotations
