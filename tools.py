@@ -79,7 +79,7 @@ def tool(name: str, description: str, properties: dict, required: Optional[list]
         TOOLS[name] = ToolDef(name, description, {
             "type": "object",
             "properties": properties,
-            "required": required or list(properties.keys()),
+            "required": required or [],
         })
         HANDLERS[name] = fn
         return fn
@@ -440,7 +440,7 @@ def forecast_kline(klines: list, pred_len: int, lookback: Optional[int] = None,
       required=["klines"])
 def forecast_signal(klines: list, pred_len: int = 10, lookback: Optional[int] = None,
                     future_timestamps: Optional[list] = None, T: float = 1.0,
-                    top_p: float = 0.9, sample_count: int = 3,
+                    top_p: float = 0.9, sample_count: int = 5,
                     model: Optional[str] = None) -> str:
     import numpy as np
     df_in, _, _ = _parse_klines(klines, lookback)
