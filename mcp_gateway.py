@@ -28,6 +28,18 @@ from pathlib import Path
 logger = logging.getLogger("mcp-gateway")
 
 
+def _int_env(name: str, default: int) -> int:
+    """读整型环境变量，非法值回退默认（不因配置手误起不来）。"""
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("%s=%r 不是整数，回退默认 %d", name, raw, default)
+        return default
+
+
 # ═══════════════ License 鉴权 + 额度 ═══════════════
 
 class QuotaExceeded(Exception):
@@ -252,7 +264,7 @@ class Metrics:
                 "# HELP mcp_queue_jobs_total Async jobs finished by status.",
                 "# TYPE mcp_queue_jobs_total counter",
             ]
-            for status in ("done", "error"):
+            for status in ("done", "error", "expired"):
                 n = st.get("jobs_total", {}).get(status, 0)
                 lines.append(f'mcp_queue_jobs_total{{status="{status}"}} {n}')
         return "\n".join(lines) + "\n"
@@ -267,21 +279,40 @@ class QueueFull(Exception):
     """队列已满，客户端应稍后重试。"""
 
 
+class JobTimeout(Exception):
+    """单任务执行超过 job_timeout_sec（worker 侧判定，置 status=error / error=timeout）。"""
+
+
 class JobQueue:
     """有界队列 + 固定 worker 线程池执行重负载工具。
 
     - 队列满 → 提交即拒（QueueFull），不让请求堆积
-    - 结果保留 ttl_sec 供轮询，过期清掉
+    - **单任务超时** job_timeout_sec（env MCP_JOB_TIMEOUT，默认 1800s，<=0 关闭）：
+      handler 在一次性守护线程里执行，超时即置 status=error / error="timeout" 并
+      放行 worker —— 挂死任务不再永久占位。注意 Python 无法强制中断线程，底层
+      计算线程可能仍在后台跑到自然结束，其返回值被丢弃。
+    - 结果保留 ttl_sec 供轮询；终态超 TTL 后转 "expired" 墓碑（job_id 语义可查），
+      墓碑再保留 2×ttl 后清理
+    - **reaper 回收 running 超时**：running 超过 running_timeout（默认 2×job_timeout，
+      即 real worker 正常路径不会触发的上界）仍未完 → 判定 worker 失联，
+      置 status=error 并回收
     - 每 key 同时只允许 1 个重任务在跑/排队（防单用户霸占总线）
     """
 
     def __init__(self, handlers: dict, workers: int = 2, maxsize: int = 50,
-                 ttl_sec: int = 3600):
+                 ttl_sec: int = 3600, job_timeout_sec: int | None = None,
+                 reap_interval_sec: int = 300):
         self._handlers = handlers
         self._q: queue.Queue[str] = queue.Queue(maxsize=maxsize)
         self._jobs: dict[str, dict] = {}
-        self._jobs_total = {"done": 0, "error": 0}  # 累计完成数（给 /metrics）
+        self._expired: dict[str, dict] = {}  # job_id → 过期墓碑（status="expired"）
+        self._jobs_total = {"done": 0, "error": 0, "expired": 0}  # 累计数（给 /metrics）
         self._ttl = ttl_sec
+        # 单任务超时：CLI/构造参数优先，否则 env MCP_JOB_TIMEOUT，默认 1800s
+        self._job_timeout = (_int_env("MCP_JOB_TIMEOUT", 1800)
+                             if job_timeout_sec is None else int(job_timeout_sec))
+        self._running_timeout = self._job_timeout * 2 if self._job_timeout > 0 else 0
+        self._reap_interval = max(1, int(reap_interval_sec))
         self._mu = threading.Lock()
         self._stop = threading.Event()
         self._threads = [
@@ -291,6 +322,11 @@ class JobQueue:
         for t in self._threads:
             t.start()
         threading.Thread(target=self._reaper, daemon=True, name="jobreaper").start()
+
+    @property
+    def job_timeout_sec(self) -> int:
+        """单任务超时（秒）；<=0 表示不限制。"""
+        return self._job_timeout
 
     def submit(self, tool: str, args: dict, key: str = "") -> str:
         # 单 key 并发闸：已有 queued/running 的重任务 → 拒绝
@@ -302,8 +338,8 @@ class JobQueue:
         with self._mu:
             self._jobs[job_id] = {
                 "id": job_id, "tool": tool, "key": key, "status": "queued",
-                "created_at": time.time(), "finished_at": None,
-                "result": None, "error": None,
+                "created_at": time.time(), "started_at": None,
+                "finished_at": None, "result": None, "error": None,
             }
         try:
             self._q.put_nowait((job_id, tool, args))
@@ -317,7 +353,13 @@ class JobQueue:
         with self._mu:
             job = self._jobs.get(job_id)
             if job is None:
-                return None
+                # 墓碑：终态超 TTL 被回收，仍能告诉客户端"结果已过期"而非 not_found
+                tomb = self._expired.get(job_id)
+                if tomb is None:
+                    return None
+                if key and tomb["key"] and tomb["key"] != key:
+                    return None
+                return dict(tomb)
             if key and job["key"] and job["key"] != key:
                 return None  # 看不到别人的任务
             out = dict(job)
@@ -330,8 +372,32 @@ class JobQueue:
             by_status = {}
             for j in self._jobs.values():
                 by_status[j["status"]] = by_status.get(j["status"], 0) + 1
+            expired = len(self._expired)
         return {"workers": len(self._threads), "queue_size": self._q.qsize(),
-                "jobs": by_status, "jobs_total": dict(self._jobs_total)}
+                "jobs": by_status, "expired_tombstones": expired,
+                "job_timeout_sec": self._job_timeout,
+                "jobs_total": dict(self._jobs_total)}
+
+    def _run_guarded(self, tool: str, args: dict):
+        """在一次性守护线程里跑 handler 并施加单任务超时。
+
+        返回 (result, exc, timed_out)。超时后底层线程无法被强制中断，其返回值
+        被丢弃（worker 已放行，任务已置 error）。
+        """
+        box: dict = {}
+
+        def _run():
+            try:
+                box["result"] = self._handlers[tool](**args)
+            except BaseException as e:  # noqa: BLE001 — 跨线程带回原始异常
+                box["exc"] = e
+
+        th = threading.Thread(target=_run, daemon=True, name=f"jobrun-{tool}")
+        th.start()
+        th.join(self._job_timeout if self._job_timeout > 0 else None)
+        if th.is_alive():
+            return None, None, True
+        return box.get("result"), box.get("exc"), False
 
     def _worker(self):
         while not self._stop.is_set():
@@ -341,40 +407,82 @@ class JobQueue:
                 continue
             with self._mu:
                 if job_id not in self._jobs:
+                    self._q.task_done()
                     continue
                 self._jobs[job_id]["status"] = "running"
+                self._jobs[job_id]["started_at"] = time.time()
                 created_at = self._jobs[job_id]["created_at"]
             try:
-                result = self._handlers[tool](**args)
+                result, exc, timed_out = self._run_guarded(tool, args)
+                if timed_out:
+                    raise JobTimeout(
+                        f"timeout: 任务执行超过 {self._job_timeout}s 未完成，已置 error 并"
+                        "放行 worker（底层计算线程无法被强制中断，可能仍在后台收尾）")
+                if exc is not None:
+                    raise exc
                 with self._mu:
-                    self._jobs[job_id].update(status="done", result=str(result),
-                                              finished_at=time.time())
-                    self._jobs_total["done"] += 1
+                    j = self._jobs.get(job_id)
+                    # reaper 可能已把失联任务判 error（status != running）→ 不覆盖
+                    if j is not None and j["status"] == "running":
+                        j.update(status="done", result=str(result), finished_at=time.time())
+                        self._jobs_total["done"] += 1
                 METRICS.inc_call(tool, "ok")
-                METRICS.observe_latency(tool, time.time() - created_at)
-            except Exception as e:  # noqa: BLE001
+            except BaseException as e:  # noqa: BLE001
                 logger.error("job %s (%s) failed: %s", job_id, tool, e)
                 with self._mu:
-                    self._jobs[job_id].update(status="error", error=str(e),
-                                              finished_at=time.time())
-                    self._jobs_total["error"] += 1
+                    j = self._jobs.get(job_id)
+                    if j is not None and j["status"] == "running":
+                        j.update(status="error", error=str(e), finished_at=time.time())
+                        self._jobs_total["error"] += 1
                 METRICS.inc_call(tool, "error")
-                METRICS.observe_latency(tool, time.time() - created_at)
             finally:
+                METRICS.observe_latency(tool, time.time() - created_at)
                 self._q.task_done()
 
     def _reaper(self):
         while not self._stop.is_set():
-            time.sleep(300)
-            cutoff = time.time() - self._ttl
+            if self._stop.wait(self._reap_interval):
+                break
+            now = time.time()
+            cutoff = now - self._ttl
+            running_cutoff = now - self._running_timeout if self._running_timeout > 0 else None
             with self._mu:
+                # 1) running 超时（worker 线程失联/异常退出遗留）→ 置 error 回收
+                stuck = [(jid, j["tool"]) for jid, j in self._jobs.items()
+                         if j["status"] == "running" and running_cutoff is not None
+                         and (j.get("started_at") or j["created_at"]) < running_cutoff]
+                for jid, _tool in stuck:
+                    j = self._jobs[jid]
+                    j.update(status="error",
+                             error=(f"timeout: running 超过 {self._running_timeout}s 未完成，"
+                                    "reaper 判定 worker 失联并回收"),
+                             finished_at=now)
+                    self._jobs_total["error"] += 1
+                # 2) 终态超 TTL → 转 expired 墓碑（job_status 返回 expired 而非 not_found）
                 dead = [jid for jid, j in self._jobs.items()
                         if j["status"] in ("done", "error")
                         and (j["finished_at"] or 0) < cutoff]
                 for jid in dead:
-                    del self._jobs[jid]
-            if dead:
-                logger.info("reaped %d expired jobs", len(dead))
+                    j = self._jobs.pop(jid)
+                    self._expired[jid] = {
+                        "id": jid, "tool": j["tool"], "key": j["key"],
+                        "status": "expired", "created_at": j["created_at"],
+                        "finished_at": j["finished_at"],
+                        "error": j.get("error"), "result": None,
+                        "note": (f"结果已过期（默认保留 {self._ttl}s），如需结果请重新提交任务"),
+                    }
+                    self._jobs_total["expired"] += 1
+                # 3) 墓碑再留 2×TTL 防内存膨胀
+                tomb_cutoff = now - max(self._ttl * 2, 60)
+                gone = [jid for jid, t in self._expired.items()
+                        if (t.get("finished_at") or 0) < tomb_cutoff]
+                for jid in gone:
+                    del self._expired[jid]
+            for _jid, tool in stuck:
+                METRICS.inc_call(tool, "error")
+            if stuck or dead:
+                logger.info("reaper: %d running→error (超时回收), %d finished→expired",
+                            len(stuck), len(dead))
 
     def shutdown(self):
         self._stop.set()

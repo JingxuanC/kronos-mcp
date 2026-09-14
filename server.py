@@ -47,7 +47,8 @@ ASYNC_TOOLS: set[str] = {"forecast_batch"}
 JOB_STATUS_SCHEMA = {
     "name": "job_status",
     "description": "查询异步任务状态/结果。传入提交重任务时返回的 job_id，"
-                   "返回 status（queued/running/done/error）、result 或 error、elapsed_sec。"
+                   "返回 status（queued/running/done/error/expired）、result 或 error、elapsed_sec。"
+                   "expired = 任务曾完成但结果已过 TTL 被回收；not_found = 从未提交或不属于当前 key。"
                    "重任务提交后用它轮询，无需直接 HTTP 访问 GET /jobs/<id>。",
     "inputSchema": {
         "type": "object",
@@ -252,15 +253,20 @@ def main():
                     help="异步任务 worker 数（env MCP_WORKERS，默认 2）")
     ap.add_argument("--queue-size", type=int, default=int(os.environ.get("MCP_QUEUE_SIZE", "50")),
                     help="异步队列上限（env MCP_QUEUE_SIZE，默认 50）")
+    ap.add_argument("--job-timeout", type=int, default=int(os.environ.get("MCP_JOB_TIMEOUT", "1800")),
+                    help="单个异步任务超时秒数（env MCP_JOB_TIMEOUT，默认 1800；<=0 关闭）；"
+                         "超时置 status=error/error=timeout，reaper 以 2×该值回收失联 running 任务")
     args = ap.parse_args()
 
     KronosHandler.license_store = LicenseStore(args.license_file, domain="kronos")
-    KronosHandler.job_queue = JobQueue(HANDLERS, workers=args.workers, maxsize=args.queue_size)
+    KronosHandler.job_queue = JobQueue(HANDLERS, workers=args.workers, maxsize=args.queue_size,
+                                       job_timeout_sec=args.job_timeout)
 
     server = ThreadingHTTPServer((args.host, args.port), KronosHandler)
-    logger.info("kronos MCP listening on %s:%d (tools=%d, auth=%s, workers=%d)",
+    logger.info("kronos MCP listening on %s:%d (tools=%d, auth=%s, workers=%d, job_timeout=%ss)",
                 args.host, args.port, len(TOOLS) + len(EXTRA_SCHEMAS),
-                "on" if KronosHandler.license_store.enabled else "open", args.workers)
+                "on" if KronosHandler.license_store.enabled else "open", args.workers,
+                args.job_timeout if args.job_timeout > 0 else "off")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

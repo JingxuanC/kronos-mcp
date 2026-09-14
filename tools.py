@@ -5,17 +5,24 @@
 另接入亚马逊时序基础模型 Chronos-2（amazon/chronos-2，Apache-2.0，
 chronos-forecasting v2.x，Chronos2Pipeline）作为可选后端（model="chronos2"）。
 
-- forecast_kline：零样本 K 线预测（同步，秒~分钟级，取决于 pred_len 与设备）
-- forecast_signal：交易视角结论（方向 + expected_return + 多次采样置信度）
-- forecast_batch：批量预测，重负载，入 JobQueue 异步执行（见 server.py ASYNC_TOOLS）
+- forecast_kline：零样本 K 线预测（同步，秒~分钟级，取决于 pred_len 与设备）；
+  输出含 summary + uncertainty（kronos 采样路径 std / chronos2 分位区间）+ disclaimer
+- forecast_signal：交易视角结论（方向 + expected_return + 多次采样置信度）；
+  direction/expected_return/summary 统一为 N 次采样均值口径
+- forecast_batch：批量预测，重负载，入 JobQueue 异步执行（见 server.py ASYNC_TOOLS），
+  用 job_status 工具在 MCP 协议内轮询结果
 - forecast_compare：同一输入跑 kronos + chronos2 双模型对比（同步）
 - model_info：当前加载模型 / 设备 / 参数量 / 可用模型清单
+
+4 个预测类工具的每个输出载荷都带 disclaimer（模型输出，非投资建议；概率性预测）。
+推断预测轴会跳过周六/周日（+ KRONOS_HOLIDAYS），见 _future_timestamps。
 
 模型惰性加载：首次 forecast 才从 HuggingFace 下载 + 加载，线程锁防并发重复
 加载。env：
     KRONOS_MODEL     预测模型 repo id（默认 NeoQuasar/Kronos-small）
     KRONOS_TOKENIZER 分词器 repo id（默认 NeoQuasar/Kronos-Tokenizer-base）
     KRONOS_DEVICE    cpu / cuda / mps / auto（默认 auto：cuda > mps > cpu）
+    KRONOS_HOLIDAYS  额外非交易日（逗号/空格分隔 YYYY-MM-DD），推断预测轴时跳过
     MODEL_CACHE      模型快照本地目录（Docker 镜像预下载到 /models）；
                      设置后优先走 snapshot_download 本地缓存，HF_HUB_OFFLINE=1
                      时纯离线命中；未设置则走默认 HF 缓存，挂卷换模型不受影响
@@ -51,6 +58,12 @@ DEFAULT_CHRONOS2_PATH = "/app/models-cache/chronos-2"
 CHRONOS2_ALIASES = {"chronos2", "chronos-2", "chronos"}
 # 方向判定阈值：|expected_return_pct| 小于该值视为 flat
 FLAT_BAND_PCT = 0.1
+# 免责声明：所有预测类工具的输出与描述都必须带（模型输出，非投资建议）
+DISCLAIMER = ("模型输出，非投资建议；概率性预测存在不确定性，不构成任何买卖建议，"
+              "请结合其他信息独立判断并自担风险")
+# 额外非交易日（休市日）补充：逗号/空格分隔的 YYYY-MM-DD。无交易日历依赖时，
+# 推断预测轴至少跳过周六/周日，节假日可用该环境变量补齐。
+HOLIDAYS_ENV = "KRONOS_HOLIDAYS"
 
 
 def _is_chronos2(model: Optional[str]) -> bool:
@@ -223,31 +236,91 @@ def _parse_klines(klines: list, lookback: Optional[int]):
     ts_raw = [r[0] for r in recs]
     try:
         x_ts = pd.to_datetime(pd.Series(ts_raw))
-        ts_ok = True
-    except (ValueError, TypeError):
+        # 时间戳缺失/全不可解析（NaT）同样视为解析失败 → 走 index 序号降级，
+        # 避免把 NaN 时间特征喂给模型
+        ts_ok = ts_key is not None and not pd.isna(x_ts).all()
+        if not ts_ok:
+            raise ValueError("时间戳缺失或全部不可解析")
+    except (ValueError, TypeError, OverflowError):
         x_ts = pd.Series(np.arange(len(recs)))
         ts_ok = False
     return df, x_ts, ts_ok
 
 
+def _extra_holidays() -> set:
+    """KRONOS_HOLIDAYS 里的额外休市日（无交易日历依赖时的节假日补充）。"""
+    raw = os.environ.get(HOLIDAYS_ENV, "")
+    if not raw.strip():
+        return set()
+    import pandas as pd
+    out = set()
+    for tok in raw.replace(";", ",").replace(" ", ",").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            out.add(pd.Timestamp(tok).normalize())
+        except (ValueError, TypeError):
+            logger.warning("忽略非法的 %s 日期: %r", HOLIDAYS_ENV, tok)
+    return out
+
+
+def _is_non_trading(ts, holidays: set) -> bool:
+    """周六/周日 或 显式休市日 → 非交易日。"""
+    return ts.weekday() >= 5 or ts.normalize() in holidays
+
+
+def _index_axis(x_ts, pred_len: int):
+    """index 降级轴：从输入序号之后继续（保证与输入轴连续、不重叠）。
+
+    时间戳解析失败时 x_ts 是 0..n-1 的序号；预测轴必须从 n 开始，否则
+    KronosPredictor 里 x/y 的合成时间特征会重叠甚至倒序。
+    """
+    import numpy as np
+    import pandas as pd
+    try:
+        start = int(x_ts.iloc[-1]) + 1
+    except (TypeError, ValueError, AttributeError, IndexError):
+        start = len(x_ts)  # x_ts 是 datetime（如 step<=0 分支）→ 用长度兜底
+    return pd.Series(np.arange(start, start + pred_len))
+
+
 def _future_timestamps(x_ts, ts_ok: bool, pred_len: int, future_timestamps: Optional[list]):
-    """预测轴时间戳：调用方给了就用；否则按输入中位间隔顺延（日/分钟自适应）；
-    解析失败退回 index 序号并标注。"""
+    """预测轴时间戳：调用方给了就用（行为不变，不做跳过）；否则按输入中位间隔
+    顺延（日/分钟自适应），**推断时跳过周六/周日**（+ KRONOS_HOLIDAYS 额外休市日），
+    避免给交易员推出"周末K线"；解析失败退回 index 序号并标注。
+
+    返回 (y_ts, timestamps_mode, timestamps_note)。
+    """
     import pandas as pd
     if future_timestamps:
         if len(future_timestamps) < pred_len:
             raise ValueError(f"future_timestamps 长度 {len(future_timestamps)} 小于 pred_len {pred_len}")
         return pd.to_datetime(pd.Series(future_timestamps[:pred_len])), "provided", None
     if not ts_ok:
-        import numpy as np
-        return pd.Series(np.arange(pred_len)), "index", "timestamps 解析失败，预测轴用 index 序号代替"
+        return _index_axis(x_ts, pred_len), "index", "timestamps 解析失败，预测轴用 index 序号代替"
     diffs = x_ts.diff().dropna()
     if len(diffs) == 0:
-        import numpy as np
-        return pd.Series(np.arange(pred_len)), "index", "单点时间戳无法推断频率，用 index 序号代替"
+        return _index_axis(x_ts, pred_len), "index", "单点时间戳无法推断频率，用 index 序号代替"
     step = diffs.median()  # 中位间隔：5min 线的午休/跨日缺口不影响主频率
-    y_ts = pd.Series([x_ts.iloc[-1] + step * (i + 1) for i in range(pred_len)])
-    return y_ts, "inferred", None
+    if pd.isna(step) or step <= pd.Timedelta(0):  # 时间戳重复/倒退 → 无法外推
+        return _index_axis(x_ts, pred_len), "index", "时间戳间隔为 0 或倒退，无法推断，用 index 序号代替"
+    holidays = _extra_holidays()
+    cur = x_ts.iloc[-1]
+    stamps, skipped = [], False
+    for _ in range(pred_len):
+        cur = cur + step
+        while _is_non_trading(cur, holidays):
+            cur = cur + step  # 跳过周六/周日（及休市日）继续顺延
+            skipped = True
+        stamps.append(cur)
+    y_ts = pd.Series(stamps)
+    note = None
+    if skipped:
+        note = ("weekends skipped：推断的预测轴已跳过周六/周日"
+                + ("与 KRONOS_HOLIDAYS 指定休市日" if holidays else "")
+                + "（非交易日）；显式传入 future_timestamps 时不做跳过")
+    return y_ts, "inferred", note
 
 
 def _fmt_ts(v) -> str:
@@ -258,29 +331,51 @@ def _fmt_ts(v) -> str:
 # 核心预测
 # ═══════════════════════════════════════════════════════════════
 
+def _supports_return_std(predictor) -> bool:
+    """KronosPredictor.predict 是否支持 return_std（本仓 vendored 版本多一个可选参数）。
+
+    上游 Kronos 的 predict() 没有该参数；若 model/ 被上游覆盖，这里自动退化，
+    只输出点预测 + 说明，不会因关键字参数报 TypeError。
+    """
+    try:
+        import inspect
+        return "return_std" in inspect.signature(predictor.predict).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def _predict_kronos(klines, pred_len, lookback, future_timestamps,
                     T, top_p, sample_count, model_name):
-    """Kronos 后端：跑一次预测，返回 (pred_df, y_ts, ts_mode, ts_note, model_name, device, elapsed_ms)。"""
+    """Kronos 后端：跑一次预测，返回 (pred_df, y_ts, ts_mode, ts_note, model_name,
+    device, elapsed_ms, std_df)。std_df 为同一次推理内 sample_count 条采样路径的
+    标准差（不确定性）；后端不支持时 None。"""
     import pandas as pd  # noqa: F401
     if not isinstance(pred_len, int) or pred_len < 1:
         raise ValueError("pred_len 必须为 >= 1 的整数")
     df, x_ts, ts_ok = _parse_klines(klines, lookback)
     y_ts, ts_mode, ts_note = _future_timestamps(x_ts, ts_ok, pred_len, future_timestamps)
     predictor, mname, device = _HOLDER.get(model_name)
+    use_std = _supports_return_std(predictor)
     t0 = time.time()
     with _HOLDER._lock:  # 推理串行化：CPU 场景下并发 predict 没有收益且容易打满
-        pred_df = predictor.predict(df, x_ts, y_ts, pred_len=pred_len,
-                                    T=T, top_p=top_p, sample_count=sample_count,
-                                    verbose=False)
+        out = predictor.predict(df, x_ts, y_ts, pred_len=pred_len,
+                                T=T, top_p=top_p, sample_count=sample_count,
+                                verbose=False, return_std=use_std)
+    if use_std:
+        pred_df, std_df = out
+    else:
+        pred_df, std_df = out, None
     elapsed_ms = int((time.time() - t0) * 1000)
-    return pred_df, y_ts, ts_mode, ts_note, mname, device, elapsed_ms
+    return pred_df, y_ts, ts_mode, ts_note, mname, device, elapsed_ms, std_df
 
 
 def _predict_chronos2(klines, pred_len, lookback, future_timestamps):
     """Chronos-2 后端：只建模 close 序列（单变量 target，volume 作为 past_covariates）。
-    返回与 kronos 后端同构的 (pred_df, y_ts, ts_mode, ts_note, model_name, device, elapsed_ms)；
-    pred_df 中 open=close=中位数路径，high=0.9 分位，low=0.1 分位，volume/amount=0，
-    另带 close_p10/close_p90 两列（加法式扩展，供 _paths_json 透传）。"""
+    返回与 kronos 后端同构的 (pred_df, y_ts, ts_mode, ts_note, model_name, device,
+    elapsed_ms, std_df)；std_df 恒为 None（chronos2 是确定性分位数预测，不确定性
+    由 pred_df 的 close_p10/close_p90 区间表达）；pred_df 中 open=close=中位数路径，
+    high=0.9 分位，low=0.1 分位，volume/amount=0，另带 close_p10/close_p90 两列
+    （加法式扩展，供 _paths_json 透传）。"""
     import numpy as np
     import pandas as pd
     if not isinstance(pred_len, int) or pred_len < 1:
@@ -307,13 +402,15 @@ def _predict_chronos2(klines, pred_len, lookback, future_timestamps):
         "volume": 0.0, "amount": 0.0,
         "close_p10": p10, "close_p90": p90,
     })
-    return pred_df, y_ts, ts_mode, ts_note, f"chronos2 ({CHRONOS2_MODEL_ID})", "cpu", elapsed_ms
+    return pred_df, y_ts, ts_mode, ts_note, f"chronos2 ({CHRONOS2_MODEL_ID})", "cpu", elapsed_ms, None
 
 
 def _predict_core(klines, pred_len, lookback, future_timestamps,
                   T, top_p, sample_count, model_name):
     """按 model 参数分派后端（默认 kronos；model="chronos2" 走 Chronos-2，
-    此时 T/top_p/sample_count 不适用，直接忽略——chronos2 是确定性分位数预测）。"""
+    此时 T/top_p/sample_count 不适用，直接忽略——chronos2 是确定性分位数预测）。
+    两个后端返回同构的 8 元组：(pred_df, y_ts, ts_mode, ts_note, model_name,
+    device, elapsed_ms, std_df)；std_df 仅 kronos 有（采样路径 std），chronos2 为 None。"""
     if _is_chronos2(model_name):
         return _predict_chronos2(klines, pred_len, lookback, future_timestamps)
     return _predict_kronos(klines, pred_len, lookback, future_timestamps,
@@ -342,7 +439,7 @@ def _summarize(pred_df, last_close: float, mname: str, device: str, elapsed_ms: 
     }
 
 
-def _paths_json(pred_df, y_ts) -> list:
+def _paths_json(pred_df, y_ts, std_df=None) -> list:
     has_band = "close_p10" in pred_df.columns and "close_p90" in pred_df.columns
     out = []
     for i in range(len(pred_df)):
@@ -358,8 +455,29 @@ def _paths_json(pred_df, y_ts) -> list:
         if has_band:  # chronos2：加法式附上 10%/90% 收盘价区间
             entry["close_p10"] = round(float(row["close_p10"]), 4)
             entry["close_p90"] = round(float(row["close_p90"]), 4)
+        if std_df is not None:  # kronos：该时刻 close 的采样标准差（不确定性）
+            entry["close_std"] = round(float(std_df["close"].iloc[i]), 4)
         out.append(entry)
     return out
+
+
+def _uncertainty_block(pred_df, std_df, sample_count: int, mname: str) -> dict:
+    """不确定性信息：kronos 用同一次推理内 sample_count 条采样路径的 std；
+    chronos2 用 10%-90% 分位区间（确定性分位数预测，无采样随机性）。"""
+    if std_df is not None:
+        return {
+            "basis": f"采样路径离散度：同一次推理内 sample_count={sample_count} 条采样路径的 std",
+            "sample_count": sample_count,
+            "path_std_at_horizon": round(float(std_df["close"].iloc[-1]), 4),
+            "close_std": [round(float(v), 4) for v in std_df["close"]],
+        }
+    if "close_p10" in pred_df.columns and "close_p90" in pred_df.columns:
+        return {
+            "basis": "10%-90% 分位区间（chronos2 确定性分位数预测，无采样随机性）",
+            "close_p10": [round(float(v), 4) for v in pred_df["close_p10"]],
+            "close_p90": [round(float(v), 4) for v in pred_df["close_p90"]],
+        }
+    return {"basis": "none", "note": "当前后端未提供不确定性估计，输出为单条点预测路径"}
 
 
 _KLINES_PROP = {
@@ -395,12 +513,15 @@ _COMMON_PROPS = {
 # ═══════════════════════════════════════════════════════════════
 
 @tool("forecast_kline", "Kronos 零样本 K 线预测：输入 OHLCV 历史序列，输出 pred_len 根预测K线"
-      "（open/high/low/close/volume）+ 交易视角 summary（方向/预期收益/预测波动率）。"
+      "（open/high/low/close/volume）+ 交易视角 summary（方向/预期收益/预测波动率）"
+      "+ uncertainty（不确定性：kronos 为采样路径 std / chronos2 为 10%-90% 分位区间）。"
       "model=\"chronos2\" 时切换亚马逊 Chronos-2 后端：只预测收盘价（close=中位数路径，"
       "每条附加 close_p10/close_p90 区间，open=close、high/low=分位上下界、volume 置 0，"
-      "summary.note 有说明）。预测轴时间戳可用 future_timestamps 指定，否则按输入中位间隔"
-      "自动顺延（日频/分钟频自适应）。"
-      f"约束：lookback ≤ {MAX_CONTEXT}，pred_len ≥ 1。",
+      "summary.note 有说明）。预测轴时间戳可用 future_timestamps 指定（按原样使用，不跳过"
+      "周末）；否则按输入中位间隔自动顺延（日频/分钟频自适应）并跳过周六/周日，"
+      "跳过时输出 timestamps_note=\"weekends skipped\"。"
+      f"约束：lookback ≤ {MAX_CONTEXT}，pred_len ≥ 1。"
+      f"本工具输出为模型输出，非投资建议；概率性预测，请自行判断并自担风险（disclaimer 字段）。",
       {"klines": _KLINES_PROP,
        "pred_len": {"type": "integer", "description": "预测K线根数（>= 1）"},
        **_COMMON_PROPS},
@@ -409,15 +530,17 @@ def forecast_kline(klines: list, pred_len: int, lookback: Optional[int] = None,
                    future_timestamps: Optional[list] = None, T: float = 1.0,
                    top_p: float = 0.9, sample_count: int = 5,
                    model: Optional[str] = None) -> str:
-    pred_df, y_ts, ts_mode, ts_note, mname, device, ms = _predict_core(
+    pred_df, y_ts, ts_mode, ts_note, mname, device, ms, std_df = _predict_core(
         klines, pred_len, lookback, future_timestamps, T, top_p, sample_count, model)
     df_in, _, _ = _parse_klines(klines, lookback)
     last_close = float(df_in["close"].iloc[-1])
     result = {
         "method": METHOD,
-        "predictions": _paths_json(pred_df, y_ts),
+        "predictions": _paths_json(pred_df, y_ts, std_df),
         "summary": _summarize(pred_df, last_close, mname, device, ms),
+        "uncertainty": _uncertainty_block(pred_df, std_df, sample_count, mname),
         "timestamps_mode": ts_mode,
+        "disclaimer": DISCLAIMER,
     }
     if ts_note:
         result["timestamps_note"] = ts_note
@@ -430,10 +553,14 @@ def forecast_kline(klines: list, pred_len: int, lookback: Optional[int] = None,
 
 @tool("forecast_signal", "交易视角预测信号：对同一输入跑 N=min(sample_count,5) 次独立采样"
       "（每次 sample_count=1），统计终点收益的方向一致率与离散度，输出 direction / "
-      "expected_return_pct / confidence(0-1) / risk_note。confidence = 方向一致率 × "
-      "1/(1+收益std%)，多次采样方向越一致、离散越小越高。比 forecast_kline 慢 N 倍。"
+      "expected_return_pct / confidence(0-1) / risk_note / return_std_pct。confidence = "
+      "方向一致率 × 1/(1+收益std%)，多次采样方向越一致、离散越小越高。比 forecast_kline 慢 N 倍。"
+      "口径统一：direction 与 expected_return_pct 同为 N 次采样的均值口径，summary 也由均值路径"
+      "生成（summary_basis=mean_of_N_runs），同一响应内不会出现两份互相矛盾的结论；"
+      "采样多数票方向另见 sample_vote_direction / sample_votes。"
       "model=\"chronos2\" 时为确定性分位数预测（无采样随机性），只跑 1 次，"
-      "confidence 恒为 1、不代表不确定性，详见 risk_note。",
+      "confidence 恒为 1、不代表不确定性，详见 risk_note。"
+      "本工具为模型输出，非投资建议；概率性预测，请自行判断并自担风险（disclaimer 字段）。",
       {"klines": _KLINES_PROP,
        "pred_len": {"type": "integer", "description": "预测K线根数（默认 10）", "default": 10},
        **_COMMON_PROPS},
@@ -443,6 +570,7 @@ def forecast_signal(klines: list, pred_len: int = 10, lookback: Optional[int] = 
                     top_p: float = 0.9, sample_count: int = 5,
                     model: Optional[str] = None) -> str:
     import numpy as np
+    import pandas as pd
     df_in, _, _ = _parse_klines(klines, lookback)
     last_close = float(df_in["close"].iloc[-1])
     # chronos2 是确定性分位数预测，多次采样结果完全相同，跑 1 次即可
@@ -451,7 +579,7 @@ def forecast_signal(klines: list, pred_len: int = 10, lookback: Optional[int] = 
     rets, preds = [], []
     mname = device = ""
     for _ in range(runs):
-        pred_df, y_ts, ts_mode, ts_note, mname, device, _ = _predict_core(
+        pred_df, y_ts, ts_mode, ts_note, mname, device, _, _std = _predict_core(
             klines, pred_len, lookback, future_timestamps, T, top_p, 1, model)
         rets.append(float(pred_df["close"].iloc[-1]) / last_close - 1.0)
         preds.append(pred_df)
@@ -461,11 +589,23 @@ def forecast_signal(klines: list, pred_len: int = 10, lookback: Optional[int] = 
     n_up = int((rets_pct > FLAT_BAND_PCT).sum())
     n_down = int((rets_pct < -FLAT_BAND_PCT).sum())
     n_flat = runs - n_up - n_down
-    direction, majority = ("up", n_up) if n_up >= n_down and n_up >= n_flat else \
+    # direction 与 expected_return_pct 必须同口径（都是 N 次均值），否则会出现
+    # "均值 -0.8% 却标 up"（旧实现取采样多数票）。多数票方向另存 sample_vote_direction。
+    direction = "up" if mean_ret > FLAT_BAND_PCT else ("down" if mean_ret < -FLAT_BAND_PCT else "flat")
+    vote_direction, majority = ("up", n_up) if n_up >= n_down and n_up >= n_flat else \
         (("down", n_down) if n_down >= n_flat else ("flat", n_flat))
     consistency = majority / runs
     confidence = round(consistency / (1.0 + ret_std), 3)
     elapsed_ms = int((time.time() - t0) * 1000)
+    # 统一口径：summary 用 N 次采样的均值路径（位置对齐逐列求均值），与顶部
+    # direction/expected_return_pct 同源。此前用 preds[-1]（末次采样）会与均值口径矛盾。
+    if len(preds) == 1:
+        summary_df, summary_basis = preds[0], "single_run"
+    else:
+        cols = list(preds[0].columns)
+        arr = np.mean([p[cols].to_numpy(dtype=float) for p in preds], axis=0)
+        summary_df = pd.DataFrame(arr, columns=cols, index=preds[0].index)
+        summary_basis = f"mean_of_{runs}_runs"
     if consistency >= 0.99 and confidence >= 0.6:
         risk_note = "多次采样方向一致、离散度低，信号相对可靠（仍为统计预测，非投资建议）"
     elif consistency < 0.6:
@@ -484,11 +624,15 @@ def forecast_signal(klines: list, pred_len: int = 10, lookback: Optional[int] = 
         "confidence": confidence,
         "runs": runs,
         "sample_returns_pct": [round(float(r), 3) for r in rets_pct],
+        "sample_vote_direction": vote_direction,
+        "sample_votes": {"up": n_up, "down": n_down, "flat": n_flat},
         "sign_consistency": round(consistency, 3),
         "return_std_pct": round(ret_std, 3),
         "risk_note": risk_note,
-        "summary": _summarize(preds[-1], last_close, mname, device, elapsed_ms),
+        "summary": _summarize(summary_df, last_close, mname, device, elapsed_ms),
+        "summary_basis": summary_basis,
         "timestamps_mode": ts_mode,
+        "disclaimer": DISCLAIMER,
     }
     if ts_note:
         result["timestamps_note"] = ts_note
@@ -501,7 +645,9 @@ def forecast_signal(klines: list, pred_len: int = 10, lookback: Optional[int] = 
 
 @tool("forecast_batch", "批量 K 线预测（异步）：series_list 每项 {id, klines}，逐项容错"
       "（单项失败不拖垮整批，结果带 error 字段）。提交后返回 job_id，"
-      "调用 job_status 工具轮询取结果。每项输出同 forecast_kline 的 summary + predictions。",
+      "调用 job_status 工具轮询取结果。每项输出同 forecast_kline 的 summary + predictions"
+      "（含 close_std 采样离散度）+ disclaimer。本工具为模型输出，非投资建议；"
+      "概率性预测，请自行判断并自担风险。",
       {"series_list": {"type": "array",
                        "description": "[{id: string, klines: [...]}, ...]，klines 格式同 forecast_kline",
                        "items": {"type": "object"}},
@@ -519,26 +665,29 @@ def forecast_batch(series_list: list, pred_len: int, lookback: Optional[int] = N
     for item in series_list:
         sid = item.get("id", f"series-{len(results)}")
         try:
-            pred_df, y_ts, ts_mode, ts_note, mname, device, ms = _predict_core(
+            pred_df, y_ts, ts_mode, ts_note, mname, device, ms, std_df = _predict_core(
                 item["klines"], pred_len, lookback, future_timestamps,
                 T, top_p, sample_count, model)
             df_in, _, _ = _parse_klines(item["klines"], lookback)
             results.append({
                 "id": sid,
-                "predictions": _paths_json(pred_df, y_ts),
+                "predictions": _paths_json(pred_df, y_ts, std_df),
                 "summary": _summarize(pred_df, float(df_in["close"].iloc[-1]), mname, device, ms),
+                "uncertainty": _uncertainty_block(pred_df, std_df, sample_count, mname),
                 "timestamps_mode": ts_mode,
+                "disclaimer": DISCLAIMER,
                 **({"timestamps_note": ts_note} if ts_note else {}),
             })
         except Exception as e:  # noqa: BLE001 — 单项容错
             logger.warning("forecast_batch item %s failed: %s", sid, e)
-            results.append({"id": sid, "error": str(e)})
+            results.append({"id": sid, "error": str(e), "disclaimer": DISCLAIMER})
     return json.dumps({
         "method": METHOD,
         "total": len(series_list),
         "succeeded": sum(1 for r in results if "error" not in r),
         "elapsed_ms": int((time.time() - t0) * 1000),
         "results": results,
+        "disclaimer": DISCLAIMER,
     }, ensure_ascii=False)
 
 
@@ -549,7 +698,9 @@ def forecast_batch(series_list: list, pred_len: int, lookback: Optional[int] = N
 @tool("forecast_compare", "双模型对比预测：同一输入依次跑 kronos 和 chronos2（CPU 2 核小机型"
       "并行无收益，串行执行），返回两边预测路径与 summary、方向是否一致、各自预期收益。"
       "单边失败不拖垮另一边（该侧带 error 字段，compare 字段置 null）——例如 chronos2 "
-      "权重尚未放置时仍可拿到 kronos 侧结果。对比耗时 ≈ 两模型各自耗时之和。",
+      "权重尚未放置时仍可拿到 kronos 侧结果。对比耗时 ≈ 两模型各自耗时之和。"
+      "两侧输出各自带 uncertainty 与 disclaimer；本工具为模型输出，非投资建议；"
+      "概率性预测，请自行判断并自担风险。",
       {"klines": _KLINES_PROP,
        "pred_len": {"type": "integer", "description": "预测K线根数（>= 1）"},
        "lookback": _COMMON_PROPS["lookback"],
@@ -567,18 +718,20 @@ def forecast_compare(klines: list, pred_len: int, lookback: Optional[int] = None
     sides = {}
     for side, mname in (("kronos", None), ("chronos2", "chronos2")):
         try:
-            pred_df, y_ts, ts_mode, ts_note, mname_out, device, ms = _predict_core(
+            pred_df, y_ts, ts_mode, ts_note, mname_out, device, ms, std_df = _predict_core(
                 klines, pred_len, lookback, future_timestamps,
                 T, top_p, sample_count, mname)
             sides[side] = {
-                "predictions": _paths_json(pred_df, y_ts),
+                "predictions": _paths_json(pred_df, y_ts, std_df),
                 "summary": _summarize(pred_df, last_close, mname_out, device, ms),
+                "uncertainty": _uncertainty_block(pred_df, std_df, sample_count, mname_out),
                 "timestamps_mode": ts_mode,
+                "disclaimer": DISCLAIMER,
                 **({"timestamps_note": ts_note} if ts_note else {}),
             }
         except Exception as e:  # noqa: BLE001 — 单边容错
             logger.warning("forecast_compare %s side failed: %s", side, e)
-            sides[side] = {"error": str(e)}
+            sides[side] = {"error": str(e), "disclaimer": DISCLAIMER}
     ok = {k: v for k, v in sides.items() if "error" not in v}
     compare = None
     if len(ok) == 2:
@@ -597,6 +750,7 @@ def forecast_compare(klines: list, pred_len: int, lookback: Optional[int] = None
         "chronos2": sides["chronos2"],
         "compare": compare,
         "elapsed_ms": int((time.time() - t0) * 1000),
+        "disclaimer": DISCLAIMER,
     }, ensure_ascii=False)
 
 

@@ -386,7 +386,7 @@ def sample_from_logits(logits, temperature=1.0, top_k=None, top_p=None, sample_l
     return x
 
 
-def auto_regressive_inference(tokenizer, model, x, x_stamp, y_stamp, max_context, pred_len, clip=5, T=1.0, top_k=0, top_p=0.99, sample_count=5, verbose=False):
+def auto_regressive_inference(tokenizer, model, x, x_stamp, y_stamp, max_context, pred_len, clip=5, T=1.0, top_k=0, top_p=0.99, sample_count=5, verbose=False, return_std=False):
     with torch.no_grad():
         x = torch.clip(x, -clip, clip)
 
@@ -464,18 +464,90 @@ def auto_regressive_inference(tokenizer, model, x, x_stamp, y_stamp, max_context
         z = tokenizer.decode(input_tokens, half=True)
         z = z.reshape(-1, sample_count, z.size(1), z.size(2))
         preds = z.cpu().numpy()
+        # 采样离散度：sample_count 条采样路径在同一时刻的 std（不确定性，
+        # 与均值路径同形）。return_std=False 时行为与上游完全一致。
+        preds_std = np.std(preds, axis=1) if return_std else None
         preds = np.mean(preds, axis=1)
 
+        if return_std:
+            return preds, preds_std
         return preds
 
 
+# 时间戳降级用的合成轴：时间戳无法解析时按序号合成为 datetime 序列，
+# 保证 calc_time_stamps 的 .dt 访问器不崩溃（上层 tools.py 的
+# timestamps_mode="index" 降级路径依赖这条承诺）。
+TIMESTAMP_FALLBACK_BASE = pd.Timestamp('2020-01-01 00:00:00')
+TIMESTAMP_FALLBACK_STEP = pd.Timedelta(days=1)
+
+
+def _synthetic_time_axis(s):
+    """数值序号 → datetime 轴：基准时间 + 序号 × 1day。
+
+    必须用**实际数值**而非行位置做偏移，否则 index 降级路径下 x 轴 [0..4] 与
+    y 轴 [5..7] 都会从基准时间重新开始，模型的时间特征会重叠甚至倒序。
+    非有限值/超出 ±100 年（如 UNIX 秒/毫秒时间戳）退回按位置偏移，避免溢出。
+    """
+    n = len(s)
+    offs = None
+    try:
+        vals = pd.to_numeric(s, errors='raise').to_numpy(dtype='float64')
+        if n and np.isfinite(vals).all() and np.abs(vals).max() <= 36500:
+            offs = vals
+    except (TypeError, ValueError):
+        offs = None
+    if offs is None:
+        offs = np.arange(n, dtype='float64')
+    return pd.Series(TIMESTAMP_FALLBACK_BASE + TIMESTAMP_FALLBACK_STEP * offs)
+
+
+def as_time_series(x_timestamp):
+    """把任意时间戳输入规范化为 datetime64 的 pd.Series。
+
+    上游只接受带 .dt 的 Series，传序号（int）/DatetimeIndex/纯 list 都会崩：
+    DatetimeIndex 根本没有 .dt 属性，int Series 的 .dt 抛 AttributeError。
+    这里统一兜住：
+      - datetime64 Series → 原样（仅重置索引）
+      - 数值（int/float，即"退回序号"）→ 基准时间 + i*1day 合成轴，
+        保证与上层生成的 index 预测轴连续可解释
+      - 可解析的字符串/日期对象 → to_datetime
+      - 不可解析 / 全 NaT → 合成轴（不抛异常，交给上层标注 index 模式）
+    """
+    if isinstance(x_timestamp, pd.Series):
+        s = x_timestamp.reset_index(drop=True)
+    elif isinstance(x_timestamp, pd.Index):
+        s = pd.Series(x_timestamp.to_numpy())  # DatetimeIndex 没有 .dt
+    elif isinstance(x_timestamp, (list, tuple)):
+        s = pd.Series(list(x_timestamp))
+    else:
+        s = pd.Series(np.asarray(x_timestamp).ravel())
+    if pd.api.types.is_datetime64_any_dtype(s):
+        return s
+    if pd.api.types.is_numeric_dtype(s):
+        # 序号不要当 ns epoch（1970）解析，用合成轴更直观且与预测轴连续
+        return _synthetic_time_axis(s)
+    try:
+        conv = pd.to_datetime(s, errors='raise')
+    except Exception:  # noqa: BLE001 — 解析失败走合成轴
+        return _synthetic_time_axis(s)
+    if pd.api.types.is_datetime64_any_dtype(conv) and not conv.isna().all():
+        return conv.reset_index(drop=True)
+    return _synthetic_time_axis(s)
+
+
 def calc_time_stamps(x_timestamp):
+    """时间戳 → 时间特征 DataFrame（minute/hour/weekday/day/month）。
+
+    兼容 pd.Series / pd.DatetimeIndex / list / 数值序号：非 datetimelike 输入
+    由 as_time_series 合成为基准时间轴，不再抛 AttributeError。
+    """
+    ts = as_time_series(x_timestamp)
     time_df = pd.DataFrame()
-    time_df['minute'] = x_timestamp.dt.minute
-    time_df['hour'] = x_timestamp.dt.hour
-    time_df['weekday'] = x_timestamp.dt.weekday
-    time_df['day'] = x_timestamp.dt.day
-    time_df['month'] = x_timestamp.dt.month
+    time_df['minute'] = ts.dt.minute
+    time_df['hour'] = ts.dt.hour
+    time_df['weekday'] = ts.dt.weekday
+    time_df['day'] = ts.dt.day
+    time_df['month'] = ts.dt.month
     return time_df
 
 
@@ -505,18 +577,22 @@ class KronosPredictor:
         self.tokenizer = self.tokenizer.to(self.device)
         self.model = self.model.to(self.device)
 
-    def generate(self, x, x_stamp, y_stamp, pred_len, T, top_k, top_p, sample_count, verbose):
+    def generate(self, x, x_stamp, y_stamp, pred_len, T, top_k, top_p, sample_count, verbose, return_std=False):
 
         x_tensor = torch.from_numpy(np.array(x).astype(np.float32)).to(self.device)
         x_stamp_tensor = torch.from_numpy(np.array(x_stamp).astype(np.float32)).to(self.device)
         y_stamp_tensor = torch.from_numpy(np.array(y_stamp).astype(np.float32)).to(self.device)
 
-        preds = auto_regressive_inference(self.tokenizer, self.model, x_tensor, x_stamp_tensor, y_stamp_tensor, self.max_context, pred_len,
-                                          self.clip, T, top_k, top_p, sample_count, verbose)
+        out = auto_regressive_inference(self.tokenizer, self.model, x_tensor, x_stamp_tensor, y_stamp_tensor, self.max_context, pred_len,
+                                        self.clip, T, top_k, top_p, sample_count, verbose, return_std=return_std)
+        if return_std:
+            preds, preds_std = out
+            return preds[:, -pred_len:, :], preds_std[:, -pred_len:, :]
+        preds = out
         preds = preds[:, -pred_len:, :]
         return preds
 
-    def predict(self, df, x_timestamp, y_timestamp, pred_len, T=1.0, top_k=0, top_p=0.9, sample_count=1, verbose=True):
+    def predict(self, df, x_timestamp, y_timestamp, pred_len, T=1.0, top_k=0, top_p=0.9, sample_count=1, verbose=True, return_std=False):
 
         if not isinstance(df, pd.DataFrame):
             raise ValueError("Input must be a pandas DataFrame.")
@@ -550,13 +626,24 @@ class KronosPredictor:
         x_stamp = x_stamp[np.newaxis, :]
         y_stamp = y_stamp[np.newaxis, :]
 
-        preds = self.generate(x, x_stamp, y_stamp, pred_len, T, top_k, top_p, sample_count, verbose)
+        preds = self.generate(x, x_stamp, y_stamp, pred_len, T, top_k, top_p, sample_count, verbose,
+                              return_std=return_std)
 
+        if return_std:
+            preds, preds_std = preds
+        else:
+            preds_std = None
         preds = preds.squeeze(0)
         preds = preds * (x_std + 1e-5) + x_mean
 
         pred_df = pd.DataFrame(preds, columns=self.price_cols + [self.vol_col, self.amt_vol], index=y_timestamp)
-        return pred_df
+        if preds_std is None:
+            return pred_df
+        # 离散度只做反向缩放（不加均值）；与 pred_df 同列同索引，
+        # 供上层输出 path_std / close_std（不确定性）。
+        preds_std = preds_std.squeeze(0) * (x_std + 1e-5)
+        return pred_df, pd.DataFrame(preds_std, columns=self.price_cols + [self.vol_col, self.amt_vol],
+                                     index=y_timestamp)
 
 
     def predict_batch(self, df_list, x_timestamp_list, y_timestamp_list, pred_len, T=1.0, top_k=0, top_p=0.9, sample_count=1, verbose=True):
