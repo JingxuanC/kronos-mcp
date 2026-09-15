@@ -210,6 +210,16 @@ def _parse_klines(klines: list, lookback: Optional[int]):
     """klines JSON → (df, x_timestamp)。amount 缺省用 volume*close 近似。"""
     import numpy as np
     import pandas as pd
+
+    import panel
+    # 统一 panel 契约：{symbol: bars} / 列式 panel / 宽表 / 长表 / 裸数值序列
+    # 都先归一化成扁平 bar 数组（2026-09-15 前只接受 list of bar dicts，
+    # 于是同一个 agent 要为不同工具反复转换形状）
+    if not panel.is_flat_bars(klines):
+        try:
+            klines = panel.as_bars(klines)
+        except panel.PanelError as e:
+            raise ValueError("klines 无法解析: %s" % e)
     if not isinstance(klines, list) or len(klines) < 2:
         raise ValueError("klines 至少需要 2 根K线")
     lb = lookback or len(klines)
@@ -658,6 +668,12 @@ def forecast_batch(series_list: list, pred_len: int, lookback: Optional[int] = N
                    future_timestamps: Optional[list] = None, T: float = 1.0,
                    top_p: float = 0.9, sample_count: int = 5,
                    model: Optional[str] = None) -> str:
+    # 三种等价形态：原生 [{id?, klines}, ...]；{symbol: bars}；[[bars], ...]
+    if isinstance(series_list, dict):
+        series_list = [{"id": str(k), "klines": v} for k, v in series_list.items()]
+    elif isinstance(series_list, list) and series_list and not isinstance(series_list[0], dict):
+        series_list = [{"id": "series-%d" % i, "klines": v}
+                       for i, v in enumerate(series_list)]
     if not isinstance(series_list, list) or not series_list:
         raise ValueError("series_list 不能为空")
     t0 = time.time()
