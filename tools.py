@@ -38,7 +38,7 @@ import logging
 import os
 import threading
 import time
-from typing import Optional
+from typing import Any, Optional
 
 logger = logging.getLogger("kronos-mcp.tools")
 
@@ -491,7 +491,9 @@ def _uncertainty_block(pred_df, std_df, sample_count: int, mname: str) -> dict:
 
 
 _KLINES_PROP = {
-    "type": "array",
+    # 形状容差：注解侧必须同步放宽 —— 网关按**函数注解**校验
+    # （mcp_common._ann_type），只放宽函数体没用。
+    "anyOf": [{"type": "array"}, {"type": "object"}],
     "description": "K线数组（时间升序）: [{timestamps, open, high, low, close, volume, amount?}, ...]。"
                    "timestamps 支持 ISO 字符串/日期；amount 缺省时用 volume*close 近似",
     "items": {"type": "object",
@@ -536,7 +538,7 @@ _COMMON_PROPS = {
        "pred_len": {"type": "integer", "description": "预测K线根数（>= 1）"},
        **_COMMON_PROPS},
       required=["klines", "pred_len"])
-def forecast_kline(klines: list, pred_len: int, lookback: Optional[int] = None,
+def forecast_kline(klines: Any, pred_len: int, lookback: Optional[int] = None,
                    future_timestamps: Optional[list] = None, T: float = 1.0,
                    top_p: float = 0.9, sample_count: int = 5,
                    model: Optional[str] = None) -> str:
@@ -575,7 +577,7 @@ def forecast_kline(klines: list, pred_len: int, lookback: Optional[int] = None,
        "pred_len": {"type": "integer", "description": "预测K线根数（默认 10）", "default": 10},
        **_COMMON_PROPS},
       required=["klines"])
-def forecast_signal(klines: list, pred_len: int = 10, lookback: Optional[int] = None,
+def forecast_signal(klines: Any, pred_len: int = 10, lookback: Optional[int] = None,
                     future_timestamps: Optional[list] = None, T: float = 1.0,
                     top_p: float = 0.9, sample_count: int = 5,
                     model: Optional[str] = None) -> str:
@@ -664,16 +666,16 @@ def forecast_signal(klines: list, pred_len: int = 10, lookback: Optional[int] = 
        "pred_len": {"type": "integer", "description": "预测K线根数（>= 1）"},
        **_COMMON_PROPS},
       required=["series_list", "pred_len"])
-def forecast_batch(series_list: list, pred_len: int, lookback: Optional[int] = None,
+def forecast_batch(series_list: Any, pred_len: int, lookback: Optional[int] = None,
                    future_timestamps: Optional[list] = None, T: float = 1.0,
                    top_p: float = 0.9, sample_count: int = 5,
                    model: Optional[str] = None) -> str:
-    # 三种等价形态：原生 [{id?, klines}, ...]；{symbol: bars}；[[bars], ...]
-    if isinstance(series_list, dict):
-        series_list = [{"id": str(k), "klines": v} for k, v in series_list.items()]
-    elif isinstance(series_list, list) and series_list and not isinstance(series_list[0], dict):
-        series_list = [{"id": "series-%d" % i, "klines": v}
-                       for i, v in enumerate(series_list)]
+    import panel
+    # 三种等价形态：原生 [{id?, klines}, ...]；{id/symbol: bars}；[[bars], ...]
+    try:
+        series_list = panel.as_series_list(series_list, symbol_key="id")
+    except panel.PanelError as e:
+        raise ValueError("series_list 无法解析: %s" % e)
     if not isinstance(series_list, list) or not series_list:
         raise ValueError("series_list 不能为空")
     t0 = time.time()
@@ -725,7 +727,7 @@ def forecast_batch(series_list: list, pred_len: int, lookback: Optional[int] = N
        "top_p": _COMMON_PROPS["top_p"],
        "sample_count": _COMMON_PROPS["sample_count"]},
       required=["klines", "pred_len"])
-def forecast_compare(klines: list, pred_len: int, lookback: Optional[int] = None,
+def forecast_compare(klines: Any, pred_len: int, lookback: Optional[int] = None,
                      future_timestamps: Optional[list] = None, T: float = 1.0,
                      top_p: float = 0.9, sample_count: int = 5) -> str:
     df_in, _, _ = _parse_klines(klines, lookback)
@@ -816,3 +818,10 @@ def model_info() -> str:
 
 
 EXTRA_SCHEMAS: dict = {}
+
+
+# 形状容差参数清单：(工具名, 参数名) —— 供测试钉住网关层的注解放宽。
+SHAPE_TOLERANT_ARGS = [
+    ("forecast_kline", "klines"), ("forecast_signal", "klines"),
+    ("forecast_compare", "klines"), ("forecast_batch", "series_list"),
+]
